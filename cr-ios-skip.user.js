@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CR iOS spoof + auto skip
 // @namespace    tomculp
-// @version      0.3.1
+// @version      0.4
 // @description  Desktop Safari spoof for crunchyroll.com plus auto Skip Intro / Skip Credits / next episode, driven by video timeupdate so it survives background throttling.
 // @match        https://www.crunchyroll.com/*
 // @match        https://crunchyroll.com/*
@@ -11,6 +11,10 @@
 // @updateURL    https://raw.githubusercontent.com/tnculp/userscripts/main/cr-ios-skip.user.js
 // ==/UserScript==
 
+// 0.4: credits skip fix. Matches any skip-like data-testid (incl. skip-credits-*
+// and the reused skipIntroText), accepts div role=button controls as well as
+// <button>, and clicks with a full pointer/mouse sequence.
+//
 // 0.3: identical logic to 0.2, ASCII only. Orion's Tampermonkey storage appears to
 // mangle non-ASCII bytes on an unclean app close, which showed up as a syntax error
 // on reopen. Nothing outside plain ASCII is in this file.
@@ -52,22 +56,18 @@
   // config
   var SKIP_COOLDOWN_MS = 7000;
   var END_THRESHOLD_S  = 1.5;
-  var SKIP_TESTIDS = [
-    'button[data-testid="skip-intro-button"]',
-    'button[data-testid="skip-ending-button"]',
-    'button[data-testid="skip-outro-button"]',
-    'button[data-testid="skipButton"]',
-    '[data-testid="skipIntroText"]',
-    '[data-testid="skip-intro-icon"]',
-    '[data-testid="skip-ending-icon"]',
-    '[data-testid="skip-outro-icon"]'
-  ];
+  // Any element whose data-testid looks like a skip control. Crunchyroll has used
+  // skip-intro-*, skip-ending-*, skip-outro-*, skip-credits-*, skipButton and
+  // skipIntroText (the last one is reused for SKIP CREDITS / SKIP RECAP too).
+  var SKIP_TESTID_RE = /skip.*(intro|opening|ending|outro|credit|recap|button|text|icon)/i;
   var SKIP_TEXT = [
     /skip\s*(opening|intro)/i,
     /skip\s*(ending|credits?|outro)/i,
     /skip\s*recap/i,
     /^skip$/i
   ];
+  // Things that can be the actual clickable control.
+  var CLICKABLE = 'button, [role="button"]';
   var NEXT_SELECTORS = [
     '[data-testid="next-episode-button"]',
     '[aria-label*="Next Episode" i]',
@@ -93,26 +93,50 @@
     return (btn.getAttribute('aria-label') || btn.textContent || '').trim();
   }
 
+  // The element to click for a matched node: its nearest button or role=button
+  // ancestor, or the node itself if it has neither (some builds use a bare div).
+  function clickTarget(el) {
+    return (el.closest && el.closest(CLICKABLE)) || el;
+  }
+
+  function labelMatches(label) {
+    if (!label || label.length > 40) return false;
+    for (var j = 0; j < SKIP_TEXT.length; j++) {
+      if (SKIP_TEXT[j].test(label)) return true;
+    }
+    return false;
+  }
+
   function findSkipButton() {
     var i, el, btn;
-    for (i = 0; i < SKIP_TESTIDS.length; i++) {
-      el = null;
-      try { el = document.querySelector(SKIP_TESTIDS[i]); } catch (e) { continue; }
-      if (!el) continue;
-      btn = el.tagName === 'BUTTON' ? el : el.closest('button');
-      if (btn && isPresent(btn)) return btn;
+    // 1. data-testid
+    var tagged = document.querySelectorAll('[data-testid]');
+    for (i = 0; i < tagged.length; i++) {
+      el = tagged[i];
+      if (!SKIP_TESTID_RE.test(el.getAttribute('data-testid') || '')) continue;
+      btn = clickTarget(el);
+      if (isPresent(btn)) return btn;
     }
-    var all = document.querySelectorAll('button');
+    // 2. aria-label / text on buttons and role=button elements
+    var all = document.querySelectorAll(CLICKABLE);
     for (i = 0; i < all.length; i++) {
       btn = all[i];
-      var label = buttonLabel(btn);
-      var hit = false;
-      for (var j = 0; j < SKIP_TEXT.length; j++) {
-        if (SKIP_TEXT[j].test(label)) { hit = true; break; }
-      }
-      if (hit && isPresent(btn)) return btn;
+      if (labelMatches(buttonLabel(btn)) && isPresent(btn)) return btn;
     }
     return null;
+  }
+
+  // React handlers sometimes ignore a bare .click() on non-button elements, so
+  // send a full pointer/mouse sequence at the element's centre as well.
+  function realClick(el) {
+    var r = el.getBoundingClientRect();
+    var o = { bubbles: true, cancelable: true, view: window,
+              clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.click();
   }
 
   function clickNextEpisode() {
@@ -140,8 +164,8 @@
     if (!video.paused && !onCooldown()) {
       var btn = findSkipButton();
       if (btn) {
-        var label = buttonLabel(btn);
-        btn.click();
+        var label = buttonLabel(btn) || btn.getAttribute('data-testid') || btn.tagName;
+        realClick(btn);
         lastSkipAt = Date.now();
         log('skipped:', JSON.stringify(label), 'at', video.currentTime.toFixed(1) + 's');
       }
