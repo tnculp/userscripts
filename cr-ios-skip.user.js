@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CR iOS spoof + auto skip
 // @namespace    tomculp
-// @version      0.4
+// @version      0.5
 // @description  Desktop Safari spoof for crunchyroll.com plus auto Skip Intro / Skip Credits / next episode, driven by video timeupdate so it survives background throttling.
 // @match        https://www.crunchyroll.com/*
 // @match        https://crunchyroll.com/*
@@ -11,6 +11,11 @@
 // @updateURL    https://raw.githubusercontent.com/tnculp/userscripts/main/cr-ios-skip.user.js
 // ==/UserScript==
 
+// 0.5: lighter. Skip-button lookup runs at most once a second (text fallback
+// every 3s), uses a native [data-testid*="skip"] query instead of walking every
+// tagged element, does nothing while paused, and the 1s backup timer only
+// fires if timeupdate has gone quiet.
+//
 // 0.4: credits skip fix. Matches any skip-like data-testid (incl. skip-credits-*
 // and the reused skipIntroText), accepts div role=button controls as well as
 // <button>, and clicks with a full pointer/mouse sequence.
@@ -55,6 +60,8 @@
 
   // config
   var SKIP_COOLDOWN_MS = 7000;
+  var SCAN_EVERY_MS    = 1000;  // testid lookup
+  var TEXT_SCAN_MS     = 3000;  // aria-label / text fallback (heavier)
   var END_THRESHOLD_S  = 1.5;
   // Any element whose data-testid looks like a skip control. Crunchyroll has used
   // skip-intro-*, skip-ending-*, skip-outro-*, skip-credits-*, skipButton and
@@ -78,6 +85,9 @@
   var lastSkipAt   = 0;
   var nextFiredFor = null;
   var hooked       = new WeakSet();
+  var lastScanAt   = 0;
+  var lastTextAt   = 0;
+  var lastTickAt   = 0;
 
   var onCooldown = function () { return Date.now() - lastSkipAt < SKIP_COOLDOWN_MS; };
 
@@ -109,15 +119,18 @@
 
   function findSkipButton() {
     var i, el, btn;
-    // 1. data-testid
-    var tagged = document.querySelectorAll('[data-testid]');
+    var now = Date.now();
+    // 1. data-testid (native substring match, cheap)
+    var tagged = document.querySelectorAll('[data-testid*="skip" i]');
     for (i = 0; i < tagged.length; i++) {
       el = tagged[i];
       if (!SKIP_TESTID_RE.test(el.getAttribute('data-testid') || '')) continue;
       btn = clickTarget(el);
       if (isPresent(btn)) return btn;
     }
-    // 2. aria-label / text on buttons and role=button elements
+    // 2. aria-label / text on buttons and role=button elements, less often
+    if (now - lastTextAt < TEXT_SCAN_MS) return null;
+    lastTextAt = now;
     var all = document.querySelectorAll(CLICKABLE);
     for (i = 0; i < all.length; i++) {
       btn = all[i];
@@ -159,9 +172,12 @@
 
   // 3/4. per-tick check
   function tick(video) {
-    if (!video || !video.duration) return;
+    if (!video || !video.duration || video.paused) return;
+    var now = Date.now();
+    lastTickAt = now;
 
-    if (!video.paused && !onCooldown()) {
+    if (!onCooldown() && now - lastScanAt >= SCAN_EVERY_MS) {
+      lastScanAt = now;
       var btn = findSkipButton();
       if (btn) {
         var label = buttonLabel(btn) || btn.getAttribute('data-testid') || btn.tagName;
@@ -225,13 +241,18 @@
   var debounce = null;
   var observer = new MutationObserver(function () {
     clearTimeout(debounce);
-    debounce = setTimeout(scan, 100);
+    debounce = setTimeout(scan, 500);
   });
 
   function init() {
     observer.observe(document.documentElement, { childList: true, subtree: true });
     scan();
-    setInterval(function () { var v = document.querySelector('video'); if (v) tick(v); }, 1000);
+    // backup only: if timeupdate stops arriving, keep checking once a second
+    setInterval(function () {
+      if (Date.now() - lastTickAt < 2000) return;
+      var v = document.querySelector('video');
+      if (v) tick(v);
+    }, 1000);
     log('init on', location.pathname);
   }
 
